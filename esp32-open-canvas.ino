@@ -5,17 +5,19 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <SPIFFS.h>
+#include "esp_sleep.h"   // <-- necesario para deep sleep
 
 #define USE_HSPI_FOR_EPD
 #define GxEPD2_DISPLAY_CLASS GxEPD2_7C
 #define GxEPD2_DRIVER_CLASS  GxEPD2_730c_GDEY073D46
 
-// ---- Wi‑Fi credentials ----
-
+// ---- Wi-Fi credentials ----
+const char* WIFI_SSID = "*******";
+const char* WIFI_PASS = "*******";
 const char* API_URL   = "https://canvas.berguecio.cl/api/v1/images";
 //--------------------------------------------------
 
-// Waveshare ESP32‑Driver pins
+// Waveshare ESP32-Driver pins
 constexpr uint8_t PIN_CS   = 15;
 constexpr uint8_t PIN_DC   = 27;
 constexpr uint8_t PIN_RST  = 26;
@@ -30,9 +32,12 @@ constexpr uint8_t PIN_BUSY = 25;
       GxEPD2_DRIVER_CLASS(PIN_CS, PIN_DC, PIN_RST, PIN_BUSY));
 #endif
 
-//--------------------------------------------------
+// -------------------------------------------------
+// Variable global para el tiempo de deep sleep
+unsigned long sleepTimeMs = 0;
+// -------------------------------------------------
+
 // Helper functions
-//--------------------------------------------------
 void centerText(const char* txt){
   display.setFont(&FreeMonoBold9pt7b);
   display.setTextColor(GxEPD_BLACK);
@@ -69,24 +74,37 @@ String fetchImageURL(){
   if(code!=200){ http.end(); return String("HTTP ")+code; }
   String body = http.getString();
   http.end();
+
+  // parse URL
   int idx = body.indexOf("\"url\"");
   if(idx<0) return F("url not found");
   idx = body.indexOf('"', idx+5);
   if(idx<0) return F("parse err");
   int end = body.indexOf('"', idx+1);
   if(end<0) return F("parse err");
-  return body.substring(idx+1,end);
+  String url = body.substring(idx+1,end);
+
+  // parse remainingMs
+  idx = body.indexOf("\"remainingMs\"");
+  if(idx >= 0){
+    idx = body.indexOf(':', idx) + 1;
+    int endMs = body.indexOf(',', idx);
+    if(endMs < 0) endMs = body.indexOf('}', idx);
+    sleepTimeMs = body.substring(idx, endMs).toInt();
+  }
+
+  return url;
 }
 
 bool downloadToSpiffs(const String& url){
   WiFiClientSecure *client = new WiFiClientSecure;
-  client->setInsecure();                     // skip TLS cert validation for S3 signed URL
+  client->setInsecure();
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   http.begin(*client, url);
 
   int code = http.GET();
-  Serial.printf("HTTP code %d", code);
+  Serial.printf("HTTP code %d\n", code);
   if(code != 200){ http.end(); delete client; return false; }
 
   int len = http.getSize();
@@ -107,13 +125,10 @@ bool downloadToSpiffs(const String& url){
     if(len > 0) len -= r;
   }
   f.close(); http.end(); delete client;
-  Serial.printf("Downloaded %u bytes", total);
+  Serial.printf("Downloaded %u bytes\n", total);
   return total > 0;
 }
 
-//--------------------------------------------------
-// Render BMP (24‑bpp, 800×480) saved at /img
-//--------------------------------------------------
 void showBMP(){
   File f = SPIFFS.open("/img", FILE_READ);
   if(!f){ showMultiline("/img open fail"); return; }
@@ -141,9 +156,9 @@ void showBMP(){
         uint16_t idx = (r>200 && g<100 && b<100)?GxEPD_RED :
                        (r>200 && g>200 && b<100)?GxEPD_YELLOW :
                        (r<100 && g<100 && b>200)?GxEPD_BLUE :
-                       (r<100 && g>150 && b<100)?GxEPD_GREEN :
-                       (r>200 && g>150 && b>50)?GxEPD_ORANGE :
-                       (r>200 && g>200 && b>200)?GxEPD_WHITE : GxEPD_BLACK;
+                       (r<100 && g>100 && b<100)?GxEPD_GREEN :
+                       (r>200 && g>150 && b<50)?GxEPD_ORANGE :
+                       (r>180 && g>180 && b>180)?GxEPD_WHITE : GxEPD_BLACK;
         display.drawPixel(col, row, idx);
       }
     }
@@ -151,7 +166,6 @@ void showBMP(){
   f.close();
 }
 
-//--------------------------------------------------
 void connectWiFi(){
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -170,13 +184,18 @@ void setup(){
 
   connectWiFi();
   String imgURL = fetchImageURL();
-  //showMultiline(imgURL);
 
   if(downloadToSpiffs(imgURL)){
     delay(500);
     showBMP();
   }
+
+  // Hibernar display y entrar en deep sleep
   display.hibernate();
+  Serial.printf("Deep sleep %lu ms\n", sleepTimeMs);
+  esp_sleep_enable_timer_wakeup(sleepTimeMs * 1000ULL);
+  esp_deep_sleep_start();
 }
 
-void loop(){}
+void loop() {}
+
