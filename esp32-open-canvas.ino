@@ -5,17 +5,16 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <SPIFFS.h>
-#include "esp_sleep.h"   // <-- necesario para deep sleep
+#include "esp_sleep.h"
 
 #define USE_HSPI_FOR_EPD
 #define GxEPD2_DISPLAY_CLASS GxEPD2_7C
 #define GxEPD2_DRIVER_CLASS  GxEPD2_730c_GDEY073D46
 
 // ---- Wi-Fi credentials ----
-const char* WIFI_SSID = "*******";
-const char* WIFI_PASS = "*******";
+const char* WIFI_SSID = "****";
+const char* WIFI_PASS = "****";
 const char* API_URL   = "https://canvas.berguecio.cl/api/v1/images";
-//--------------------------------------------------
 
 // Waveshare ESP32-Driver pins
 constexpr uint8_t PIN_CS   = 15;
@@ -32,12 +31,8 @@ constexpr uint8_t PIN_BUSY = 25;
       GxEPD2_DRIVER_CLASS(PIN_CS, PIN_DC, PIN_RST, PIN_BUSY));
 #endif
 
-// -------------------------------------------------
-// Variable global para el tiempo de deep sleep
 unsigned long sleepTimeMs = 0;
-// -------------------------------------------------
 
-// Helper functions
 void centerText(const char* txt){
   display.setFont(&FreeMonoBold9pt7b);
   display.setTextColor(GxEPD_BLACK);
@@ -71,18 +66,21 @@ String fetchImageURL(){
   HTTPClient http;
   http.begin(API_URL);
   int code = http.GET();
-  if(code!=200){ http.end(); return String("HTTP ")+code; }
+  if(code != HTTP_CODE_OK){
+    http.end();
+    return String("HTTP ")+code;
+  }
   String body = http.getString();
   http.end();
 
   // parse URL
   int idx = body.indexOf("\"url\"");
-  if(idx<0) return F("url not found");
+  if(idx < 0) return F("url not found");
   idx = body.indexOf('"', idx+5);
-  if(idx<0) return F("parse err");
+  if(idx < 0) return F("parse err");
   int end = body.indexOf('"', idx+1);
-  if(end<0) return F("parse err");
-  String url = body.substring(idx+1,end);
+  if(end < 0) return F("parse err");
+  String url = body.substring(idx+1, end);
 
   // parse remainingMs
   idx = body.indexOf("\"remainingMs\"");
@@ -97,55 +95,62 @@ String fetchImageURL(){
 }
 
 bool downloadToSpiffs(const String& url){
-  WiFiClientSecure *client = new WiFiClientSecure;
-  client->setInsecure();
+  WiFiClientSecure client;
+  client.setInsecure();
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.begin(*client, url);
+  http.begin(client, url);
 
   int code = http.GET();
   Serial.printf("HTTP code %d\n", code);
-  if(code != 200){ http.end(); delete client; return false; }
-
-  int len = http.getSize();
-  if(len == 0){ Serial.println("empty body"); http.end(); delete client; return false; }
+  if(code != HTTP_CODE_OK){
+    http.end();
+    return false;
+  }
 
   File f = SPIFFS.open("/img", FILE_WRITE);
-  if(!f){ Serial.println("SPIFFS open fail"); http.end(); delete client; return false; }
-
-  uint8_t buf[1024]; size_t total = 0;
-  WiFiClient *stream = http.getStreamPtr();
-  while(http.connected() && (len > 0 || len == -1)){
-    size_t avail = stream->available();
-    if(!avail){ delay(1); continue; }
-    int r = stream->readBytes(buf, min(avail, sizeof(buf)));
-    if(r <= 0) break;
-    f.write(buf, r);
-    total += r;
-    if(len > 0) len -= r;
+  if(!f){
+    Serial.println("SPIFFS open fail");
+    http.end();
+    return false;
   }
-  f.close(); http.end(); delete client;
+
+  size_t total = http.writeToStream(&f);
   Serial.printf("Downloaded %u bytes\n", total);
+
+  f.close();
+  http.end();
   return total > 0;
 }
 
 void showBMP(){
   File f = SPIFFS.open("/img", FILE_READ);
-  if(!f){ showMultiline("/img open fail"); return; }
+  if(!f){
+    showMultiline("/img open fail");
+    return;
+  }
 
   uint8_t b0 = f.read(), b1 = f.read();
   if(b0!='B' || b1!='M'){
-    char msg[32]; sprintf(msg,"first bytes %02X %02X", b0, b1);
-    showMultiline(msg); f.close(); return;
+    char msg[32];
+    sprintf(msg,"first bytes %02X %02X", b0, b1);
+    showMultiline(msg);
+    f.close();
+    return;
   }
 
-  f.seek(10); uint32_t offs = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
-  f.seek(18); int32_t w = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
+  f.seek(10);
+  uint32_t offs = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
+  f.seek(18);
+  int32_t w = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
   int32_t h = f.read() | (f.read()<<8) | (f.read()<<16) | (f.read()<<24);
-  if(w!=800 || h!=480){ showMultiline("size mismatch"); f.close(); return; }
+  if(w!=800 || h!=480){
+    showMultiline("size mismatch");
+    f.close();
+    return;
+  }
   uint32_t rowBytes = (w*3+3)&~3;
 
-  display.setRotation(2);
   display.setFullWindow();
   display.firstPage();
   do{
@@ -158,11 +163,13 @@ void showBMP(){
                        (r<100 && g<100 && b>200)?GxEPD_BLUE :
                        (r<100 && g>100 && b<100)?GxEPD_GREEN :
                        (r>200 && g>150 && b<50)?GxEPD_ORANGE :
-                       (r>180 && g>180 && b>180)?GxEPD_WHITE : GxEPD_BLACK;
+                       (r>180 && g>180 && b>180)?GxEPD_WHITE :
+                                                  GxEPD_BLACK;
         display.drawPixel(col, row, idx);
       }
     }
   }while(display.nextPage());
+
   f.close();
 }
 
@@ -170,7 +177,9 @@ void connectWiFi(){
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t start = millis();
-  while(WiFi.status()!=WL_CONNECTED && millis()-start < 15000){ delay(500); }
+  while(WiFi.status()!=WL_CONNECTED && millis()-start < 15000){
+    delay(500);
+  }
 }
 
 void setup(){
@@ -190,7 +199,6 @@ void setup(){
     showBMP();
   }
 
-  // Hibernar display y entrar en deep sleep
   display.hibernate();
   Serial.printf("Deep sleep %lu ms\n", sleepTimeMs);
   esp_sleep_enable_timer_wakeup(sleepTimeMs * 1000ULL);
