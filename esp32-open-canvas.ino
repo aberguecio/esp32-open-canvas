@@ -11,8 +11,7 @@
 #define GxEPD2_DRIVER_CLASS  GxEPD2_730c_GDEY073D46
 
 // ---- Wi‑Fi credentials ----
-const char* WIFI_SSID = "RED-BERGUECIO-2.4G";
-const char* WIFI_PASS = "Colchagua81";
+
 const char* API_URL   = "https://canvas.berguecio.cl/api/v1/images";
 //--------------------------------------------------
 
