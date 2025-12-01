@@ -15,7 +15,7 @@
 constexpr uint8_t PIN_CS   =  1;  // LCD_CS → D6
 constexpr uint8_t PIN_DC   =  8;  // LCD_DC → D2
 constexpr uint8_t PIN_RST  = 14;  // LCD_RST→ D3
-constexpr uint8_t PIN_BUSY =  4;  // BUSY  → d11
+constexpr uint8_t PIN_BUSY =  17;  // BUSY  → d11
 
 // On-board LED
 constexpr uint8_t LED_PIN = 15;  // Internal LED
@@ -70,23 +70,40 @@ String fetchImageURL(){
   HTTPClient http;
   http.setTimeout(10000);  // 10 second timeout
 
-  Serial.println("   Starting HTTP connection...");
-  bool begun = http.begin(API_URL);
+  int code = -1;
+  const int maxRetries = 3;
 
-  if(!begun){
-    Serial.println("   ERROR: http.begin() failed");
-    return F("Connection failed");
+  for(int retry = 0; retry < maxRetries; retry++) {
+    if(retry > 0) {
+      Serial.printf("   Retry attempt %d/%d\n", retry + 1, maxRetries);
+      delay(2000);  // Wait 2 seconds between retries
+    }
+
+    Serial.println("   Starting HTTP connection...");
+    bool begun = http.begin(API_URL);
+
+    if(!begun){
+      Serial.println("   ERROR: http.begin() failed");
+      continue;  // Try again
+    }
+
+    Serial.println("   Sending GET request...");
+    code = http.GET();
+    Serial.printf("   HTTP GET code: %d\n", code);
+
+    if(code == HTTP_CODE_OK) {
+      break;  // Success!
+    }
+
+    // Log specific errors
+    if(code == -1) Serial.println("   (Connection error)");
+    if(code == -5) Serial.println("   (Connection refused/timeout)");
+    if(code == -11) Serial.println("   (Timeout)");
+    http.end();
   }
 
-  Serial.println("   Sending GET request...");
-  int code = http.GET();
-  Serial.printf("   HTTP GET code: %d\n", code);
-
   if(code != HTTP_CODE_OK){
-    Serial.println("   ERROR: HTTP GET failed");
-    if(code == -1) Serial.println("   (Connection error - check DNS, firewall, or server)");
-    if(code == -11) Serial.println("   (Timeout - server too slow or unreachable)");
-    http.end();
+    Serial.println("   ERROR: HTTP GET failed after all retries");
     return String("HTTP ")+code;
   }
   String body = http.getString();
