@@ -1,0 +1,16 @@
+# Configuration file with credentials
+config.h
+
+# Arduino build files
+build/
+*.bin
+*.elf
+*.map
+
+# IDE files
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
