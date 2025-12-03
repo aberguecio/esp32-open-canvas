@@ -132,6 +132,35 @@ const char* API_URL = "https://your-server.com/api/v1/images";
 - **Deep sleep**: <1mA
 - **Battery life** (1000mAh, 5-min updates): ~30-60 days
 
+## Architecture
+
+### State Machine Design
+
+The code uses a **state machine pattern** within `setup()` to organize the wake cycle into clear phases:
+
+```
+INIT → WIFI → API → DOWNLOAD → DISPLAY → SLEEP
+  ↓      ↓     ↓       ↓          ↓
+  └──────┴─────┴───────┴──────────→ ERROR → SLEEP
+```
+
+**Benefits:**
+- **Clear separation** of operational phases (hardware init, networking, download, display)
+- **Centralized error handling** - all errors go through a single `handleError()` function
+- **Easy debugging** - phase logging shows exactly where failures occur
+- **Simple to extend** - add new phases (e.g., OTA updates, sensor readings) easily
+- **Consistent error display** - unified error messages on e-ink screen with retry info
+
+**Why not use loop()?**
+
+The traditional Arduino `loop()` pattern would keep the ESP32 powered continuously (~150mA), wasting battery. Instead, we use `esp_deep_sleep_start()` at the end of `setup()`, which:
+- Reduces power consumption from ~150mA to <1mA during sleep
+- Provides automatic crash recovery via watchdog timer
+- Prevents memory leaks with fresh restart each cycle
+- Allows e-ink display to retain image without power
+
+Each wake cycle is independent and follows the state machine, then enters deep sleep until the next update.
+
 ## Error Handling
 
 The system displays errors on the e-ink screen with **exponential backoff** retry strategy.

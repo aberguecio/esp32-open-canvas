@@ -63,6 +63,26 @@ const unsigned long MAX_ERROR_SLEEP_MS = 12000000;     // Max 200 minutes
 const unsigned long SPI_INIT_DELAY_MS = 100;          // SPI initialization delays
 
 //=============================================================================
+// STATE MACHINE
+//=============================================================================
+
+enum SystemState {
+  STATE_INIT,
+  STATE_WIFI_CONNECT,
+  STATE_API_FETCH,
+  STATE_DOWNLOAD,
+  STATE_DISPLAY,
+  STATE_SLEEP,
+  STATE_ERROR
+};
+
+struct OperationResult {
+  bool success;
+  String errorMsg;
+  String errorDetails;
+};
+
+//=============================================================================
 
 unsigned long sleepTimeMs = DEFAULT_SLEEP_MS;
 
@@ -89,21 +109,35 @@ String getErrorDetails() {
   String details = errorMessage;
 
   if(WiFi.status() != WL_CONNECTED && errorMessage == "WiFi failed") {
+    int wifiStatus = WiFi.status();
     details += "\nStatus: ";
-    switch(WiFi.status()) {
+    switch(wifiStatus) {
+      case 0: details += "Idle"; break;
       case 1: details += "No SSID"; break;
-      case 4: details += "Connection failed"; break;
+      case 2: details += "Scan complete"; break;
+      case 3: details += "Connected"; break;
+      case 4: details += "Connect failed"; break;
+      case 5: details += "Connection lost"; break;
       case 6: details += "Disconnected"; break;
-      default: details += String(WiFi.status()); break;
+      case 255: details += "No shield"; break;
+      default:
+        details += "Unknown (";
+        details += String(wifiStatus);
+        details += ")";
+        break;
     }
   }
 
   return details;
 }
 
-String fetchImageURL(){
-  Serial.println(">> fetchImageURL(): begin HTTP GET");
+OperationResult fetchImageURL(String &imageURL, unsigned long &remainingMs){
+  Serial.println("=== API FETCH ===");
   Serial.printf("   API URL: %s\n", API_URL);
+
+  // Initialize output parameters with defaults
+  imageURL = "";
+  remainingMs = DEFAULT_SLEEP_MS;
 
   HTTPClient http;
   http.setTimeout(API_HTTP_TIMEOUT_MS);
@@ -138,8 +172,10 @@ String fetchImageURL(){
 
   if(code != HTTP_CODE_OK){
     Serial.println("   ERROR: HTTP GET failed after all retries");
-    return String("HTTP ")+code;
+    String details = "HTTP code: " + String(code);
+    return {false, "API error", details};
   }
+
   String body = http.getString();
   http.end();
   Serial.println("   HTTP GET succeeded, parsing JSON");
@@ -148,20 +184,20 @@ String fetchImageURL(){
   int idx = body.indexOf("\"url\"");
   if(idx < 0){
     Serial.println("   ERROR: \"url\" not found");
-    return F("url not found");
+    return {false, "API error", "url field not found in JSON"};
   }
   idx = body.indexOf('"', idx+5);
   if(idx < 0){
     Serial.println("   ERROR: parse err at url start");
-    return F("parse err");
+    return {false, "API error", "JSON parse error (url start)"};
   }
   int end = body.indexOf('"', idx+1);
   if(end < 0){
     Serial.println("   ERROR: parse err at url end");
-    return F("parse err");
+    return {false, "API error", "JSON parse error (url end)"};
   }
-  String url = body.substring(idx+1, end);
-  Serial.printf("   Parsed URL: %s\n", url.c_str());
+  imageURL = body.substring(idx+1, end);
+  Serial.printf("   Parsed URL: %s\n", imageURL.c_str());
 
   // parse remainingMs
   idx = body.indexOf("\"remainingMs\"");
@@ -170,165 +206,174 @@ String fetchImageURL(){
     idx = body.indexOf(':', idx) + 1;
     int endMs = body.indexOf(',', idx);
     if(endMs < 0) endMs = body.indexOf('}', idx);
-    sleepTimeMs = body.substring(idx, endMs).toInt();
-    Serial.printf("   remainingMs = %lu\n", sleepTimeMs);
+    remainingMs = body.substring(idx, endMs).toInt();
+    Serial.printf("   remainingMs = %lu\n", remainingMs);
   } else {
-    Serial.println("   No remainingMs field");
+    Serial.println("   No remainingMs field, using default");
+    remainingMs = DEFAULT_SLEEP_MS;
   }
 
-  return url;
+  return {true, "", ""};
 }
 
-bool downloadToSpiffs(const String& url){
-  Serial.printf(">> downloadToSpiffs(): URL = %s\n", url.c_str());
+OperationResult downloadToSpiffs(const String& url){
+  Serial.println("=== DOWNLOAD IMAGE ===");
+  Serial.printf("   URL: %s\n", url.c_str());
 
   WiFiClientSecure client;
   client.setInsecure();
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(DOWNLOAD_HTTP_TIMEOUT_MS);
 
-  int code = -1;
+  String lastErrorDetails = "";
 
   for(int retry = 0; retry < DOWNLOAD_MAX_RETRIES; retry++) {
     if(retry > 0) {
       Serial.printf("   Retry %d/%d\n", retry + 1, DOWNLOAD_MAX_RETRIES);
       delay(DOWNLOAD_RETRY_DELAY_MS);
-      http.end();
     }
+
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setTimeout(DOWNLOAD_HTTP_TIMEOUT_MS);
 
     if(!http.begin(client, url)) {
       Serial.println("   ERROR: http.begin() failed");
+      lastErrorDetails = "HTTP begin failed";
       continue;
     }
 
     Serial.println("   HTTP GET image");
-    code = http.GET();
+    int code = http.GET();
     Serial.printf("   HTTP code %d\n", code);
 
-    if(code == HTTP_CODE_OK) break;
+    if(code != HTTP_CODE_OK) {
+      logHTTPError(code);
+      lastErrorDetails = "HTTP code: " + String(code);
+      http.end();
+      continue;
+    }
 
-    logHTTPError(code);
-  }
+    // HTTP 200 OK - proceed with download
 
-  if(code != HTTP_CODE_OK){
-    Serial.println("   ERROR: Download failed after all retries");
-    http.end();
-    return false;
-  }
+    // Check SPIFFS space
+    size_t totalBytes = SPIFFS.totalBytes();
+    size_t usedBytes = SPIFFS.usedBytes();
+    Serial.printf("   SPIFFS: %u/%u bytes used\n", usedBytes, totalBytes);
 
-  // Now we have a successful connection - proceed with download
+    // Remove old file if exists
+    if(SPIFFS.exists("/img")) {
+      Serial.println("   Removing old /img");
+      SPIFFS.remove("/img");
+    }
 
-  // Check SPIFFS space
-  size_t totalBytes = SPIFFS.totalBytes();
-  size_t usedBytes = SPIFFS.usedBytes();
-  Serial.printf("   SPIFFS: %u/%u bytes used\n", usedBytes, totalBytes);
+    Serial.println("   Opening SPIFFS file for write");
+    File f = SPIFFS.open("/img", FILE_WRITE);
+    if(!f){
+      Serial.println("   ERROR: SPIFFS open fail");
+      http.end();
+      continue;
+    }
 
-  // Remove old file if exists
-  if(SPIFFS.exists("/img")) {
-    Serial.println("   Removing old /img");
-    SPIFFS.remove("/img");
-  }
+    Serial.println("   File opened, getting WiFiClient stream...");
 
-  Serial.println("   Opening SPIFFS file for write");
-  File f = SPIFFS.open("/img", FILE_WRITE);
-  if(!f){
-    Serial.println("   ERROR: SPIFFS open fail");
-    http.end();
-    return false;
-  }
+    // Get content length
+    int contentLength = http.getSize();
+    Serial.printf("   Expected content length: %d bytes\n", contentLength);
 
-  Serial.println("   File opened, getting WiFiClient stream...");
-
-  // Get content length
-  int contentLength = http.getSize();
-  Serial.printf("   Expected content length: %d bytes\n", contentLength);
-
-  // Get the stream
-  WiFiClient * stream = http.getStreamPtr();
-  if(!stream) {
-    Serial.println("   ERROR: Failed to get stream");
-    f.close();
-    http.end();
-    return false;
-  }
-
-  // Download with progress and timeout protection
-  uint8_t buff[512];
-  size_t total = 0;
-  unsigned long lastPrint = millis();
-  unsigned long downloadStart = millis();
-
-  while(contentLength > 0 || contentLength == -1) {
-    // Check timeout
-    if(millis() - downloadStart > DOWNLOAD_STREAM_TIMEOUT_MS) {
-      Serial.println("   ERROR: Download timeout");
+    // Get the stream
+    WiFiClient * stream = http.getStreamPtr();
+    if(!stream) {
+      Serial.println("   ERROR: Failed to get stream");
       f.close();
       http.end();
-      SPIFFS.remove("/img");
-      return false;
+      continue;
     }
 
-    size_t available = stream->available();
-    if(available) {
-      int c = stream->readBytes(buff, min(available, sizeof(buff)));
-      if(c > 0) {
-        size_t written = f.write(buff, c);
-        if(written != c) {
-          Serial.printf("   ERROR: SPIFFS write failed (%u/%d bytes)\n", written, c);
-          f.close();
-          http.end();
-          SPIFFS.remove("/img");
-          return false;
-        }
-        total += c;
-        if(contentLength > 0) {
-          contentLength -= c;
-        }
+    // Download with progress and timeout protection
+    uint8_t buff[512];
+    size_t total = 0;
+    unsigned long lastPrint = millis();
+    unsigned long downloadStart = millis();
+    bool streamError = false;
 
-        // Print progress
-        if(millis() - lastPrint > DOWNLOAD_PROGRESS_INTERVAL_MS) {
-          Serial.printf("   Downloaded: %u bytes\n", total);
-          lastPrint = millis();
-        }
-
-        // Reset timeout on successful read
-        downloadStart = millis();
+    while(contentLength > 0 || contentLength == -1) {
+      // Check timeout
+      if(millis() - downloadStart > DOWNLOAD_STREAM_TIMEOUT_MS) {
+        Serial.println("   ERROR: Download timeout");
+        streamError = true;
+        break;
       }
-    } else if(!http.connected()) {
-      // Only exit if both: no data available AND disconnected
-      Serial.println("   Connection closed and no data available");
-      break;
-    } else {
-      // No data available but still connected - wait a bit
-      delay(10);
+
+      size_t available = stream->available();
+      if(available) {
+        int c = stream->readBytes(buff, min(available, sizeof(buff)));
+        if(c > 0) {
+          size_t written = f.write(buff, c);
+          if(written != c) {
+            Serial.printf("   ERROR: SPIFFS write failed (%u/%d bytes)\n", written, c);
+            streamError = true;
+            break;
+          }
+          total += c;
+          if(contentLength > 0) {
+            contentLength -= c;
+          }
+
+          // Print progress
+          if(millis() - lastPrint > DOWNLOAD_PROGRESS_INTERVAL_MS) {
+            Serial.printf("   Downloaded: %u bytes\n", total);
+            lastPrint = millis();
+          }
+
+          // Reset timeout on successful read
+          downloadStart = millis();
+        }
+      } else if(!http.connected()) {
+        // Only exit if both: no data available AND disconnected
+        Serial.println("   Connection closed and no data available");
+        break;
+      } else {
+        // No data available but still connected - wait a bit
+        delay(10);
+      }
     }
-  }
 
-  Serial.printf("   Downloaded %u bytes total\n", total);
+    Serial.printf("   Downloaded %u bytes total\n", total);
 
-  // Validate size matches expected from HTTP headers
-  int expectedSize = http.getSize();
-  if(expectedSize > 0 && total != (size_t)expectedSize) {
-    Serial.printf("   ERROR: Size mismatch! Expected %d, got %u\n", expectedSize, total);
     f.close();
     http.end();
-    SPIFFS.remove("/img");  // Remove partial file
-    return false;
+
+    // If stream error occurred, cleanup and retry
+    if(streamError) {
+      SPIFFS.remove("/img");
+      lastErrorDetails = "Stream timeout or write error";
+      continue;
+    }
+
+    // Validate size matches expected from HTTP headers
+    int expectedSize = contentLength == -1 ? http.getSize() : http.getSize();
+    if(expectedSize > 0 && total != (size_t)expectedSize) {
+      Serial.printf("   ERROR: Size mismatch! Expected %d, got %u\n", expectedSize, total);
+      SPIFFS.remove("/img");  // Remove partial file
+      lastErrorDetails = "Size mismatch: got " + String(total) + " of " + String(expectedSize) + " bytes";
+      continue;  // Retry
+    }
+
+    // Validate reasonable size (800x480x4bpp/2 + header ≈ 192KB)
+    if(total < 1000 || total > 500000) {
+      Serial.printf("   ERROR: Invalid file size %u bytes\n", total);
+      SPIFFS.remove("/img");  // Remove corrupted file
+      lastErrorDetails = "Invalid size: " + String(total) + " bytes";
+      continue;  // Retry
+    }
+
+    // Success!
+    Serial.println("   Download completed successfully");
+    return {true, "", ""};
   }
 
-  // Validate reasonable size (800x480x4bpp/2 + header ≈ 192KB)
-  if(total < 1000 || total > 500000) {
-    Serial.printf("   ERROR: Invalid file size %u bytes\n", total);
-    f.close();
-    http.end();
-    SPIFFS.remove("/img");  // Remove corrupted file
-    return false;
-  }
-
-  f.close();
-  http.end();
-  return true;
+  // All retries failed
+  Serial.println("   ERROR: Download failed after all retries");
+  return {false, "Download failed", lastErrorDetails};
 }
 
 void showBMP(){
@@ -405,8 +450,44 @@ void showBMP(){
   f.close();
 }
 
-void connectWiFi(){
-  Serial.printf(">> connectWiFi(): SSID=%s\n", WIFI_SSID);
+//=============================================================================
+// State Machine Functions
+//=============================================================================
+
+OperationResult initHardware() {
+  Serial.println("=== HARDWARE INITIALIZATION ===");
+
+  // Initialize LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);
+  pinMode(PIN_BUSY, INPUT_PULLUP);
+
+  #if defined(ESP32)
+    delay(SPI_INIT_DELAY_MS);  // Hardware initialization delay
+    epdSPI.begin(23, 21, 22, PIN_CS);
+    display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    delay(SPI_INIT_DELAY_MS);  // Stabilization delay
+  #endif
+
+  // Initialize display
+  Serial.println("   Initializing display");
+  display.init(115200);
+  Serial.println("   Display initialized successfully");
+
+  // Initialize SPIFFS
+  Serial.println("   Initializing SPIFFS");
+  if(!SPIFFS.begin(true)) {
+    Serial.println("   ERROR: SPIFFS mount failed");
+    return {false, "SPIFFS init failed", "Cannot mount file system"};
+  }
+
+  Serial.println("   Hardware initialized successfully");
+  return {true, "", ""};
+}
+
+OperationResult connectWiFi(){
+  Serial.println("=== WIFI CONNECTION ===");
+  Serial.printf("   Connecting to SSID: %s\n", WIFI_SSID);
 
   // ESP32-C6 needs time to initialize WiFi after deep sleep
   delay(WIFI_INIT_DELAY_MS);
@@ -423,7 +504,7 @@ void connectWiFi(){
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  Serial.println("   Connecting to WiFi...");
+  Serial.println("   Connecting...");
   uint32_t start = millis();
   int attempts = 0;
 
@@ -442,143 +523,200 @@ void connectWiFi(){
     Serial.println("\n   WiFi connected!");
     Serial.printf("   IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("   RSSI: %d dBm\n", WiFi.RSSI());
+
+    // Wait for WiFi stack to stabilize
+    Serial.println("   Waiting for WiFi stack to stabilize...");
+    delay(WIFI_STABILIZE_DELAY_MS);
+
+    return {true, "", ""};
   } else {
     Serial.println("\n   ERROR: WiFi connect failed");
-    Serial.printf("   Final status: %d\n", WiFi.status());
+    int wifiStatus = WiFi.status();
+    Serial.printf("   Final status: %d\n", wifiStatus);
     Serial.println("   Status codes: 0=IDLE, 1=NO_SSID, 3=CONNECTED, 4=FAIL, 6=DISCONNECTED");
+
+    String details = "Status: ";
+    switch(wifiStatus) {
+      case 0: details += "Idle"; break;
+      case 1: details += "No SSID"; break;
+      case 4: details += "Connect failed"; break;
+      case 6: details += "Disconnected"; break;
+      case 255: details += "No shield"; break;
+      default: details += "Unknown (" + String(wifiStatus) + ")"; break;
+    }
+
+    return {false, "WiFi failed", details};
   }
 }
 
-void setup(){
-  Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
-  pinMode(PIN_BUSY, INPUT_PULLUP);
-  Serial.println("=== STARTUP ===");
+void displayError(const OperationResult &result) {
+  display.setRotation(2);
+  display.setFullWindow();
+  display.firstPage();
+  do {
+    display.fillScreen(GxEPD_WHITE);
+    display.setFont(&FreeMonoBold9pt7b);
 
-  #if defined(ESP32)
-    delay(SPI_INIT_DELAY_MS);  // Hardware initialization delay
-    epdSPI.begin(23, 21, 22, PIN_CS);
-    display.epd2.selectSPI(epdSPI,
-      SPISettings(4000000, MSBFIRST, SPI_MODE0));
-    delay(SPI_INIT_DELAY_MS);  // Stabilization delay
-  #endif
+    // Error title
+    display.setTextColor(GxEPD_RED);
+    display.setCursor(10, 30);
+    display.print("ERROR");
 
-  Serial.println("Initializing display");
-  display.init(115200);
-  Serial.println("Display initialized successfully");
+    // Error message
+    display.setTextColor(GxEPD_BLACK);
+    display.setCursor(10, 70);
+    display.print(result.errorMsg);
 
-  Serial.println("Initializing SPIFFS");
-  if(!SPIFFS.begin(true)){
-    Serial.println("   ERROR: SPIFFS mount failed");
-  }
-
-  connectWiFi();
-
-  // Check WiFi connection
-  if(WiFi.status() != WL_CONNECTED){
-    hasError = true;
-    errorMessage = "WiFi failed";
-  } else {
-    // Wait for WiFi to fully stabilize before making requests
-    Serial.println("WiFi connected, waiting for stack to stabilize...");
-    delay(WIFI_STABILIZE_DELAY_MS);
-
-    // Test DNS resolution
-    Serial.println("Testing DNS resolution...");
-    IPAddress serverIP;
-    if(WiFi.hostByName("canvas.berguecio.cl", serverIP)){
-      Serial.printf("   DNS OK: canvas.berguecio.cl -> %s\n", serverIP.toString().c_str());
-    } else {
-      Serial.println("   WARNING: DNS resolution failed!");
-    }
-
-    String imgURL = fetchImageURL();
-
-    if(imgURL.startsWith("HTTP") || imgURL.startsWith("url not") || imgURL.startsWith("parse err")){
-      Serial.println("Skipping download due to bad URL");
-      hasError = true;
-      errorMessage = "API error";
-    } else if(downloadToSpiffs(imgURL)){
-      Serial.println("Download OK, turning off LED");
-      digitalWrite(LED_PIN, LOW);
-      delay(500);
-      showBMP();
-
-      // Success! Reset error counter and backoff
-      consecutiveErrors = 0;
-      errorSleepMs = MIN_ERROR_SLEEP_MS;
-    } else {
-      Serial.println("ERROR: downloadToSpiffs() failed");
-      hasError = true;
-      errorMessage = "Download failed";
-    }
-  }
-
-  // Disconnect WiFi to save power
-  Serial.println("Disconnecting WiFi to save power");
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
-
-  // Show error on display if any occurred
-  if(hasError){
-    consecutiveErrors++;
-    Serial.printf("ERROR occurred: %s (consecutive errors: %d)\n", errorMessage.c_str(), consecutiveErrors);
-
-    // Exponential backoff: double sleep time on each error, capped at MAX
-    sleepTimeMs = errorSleepMs;
-    Serial.printf("Retry sleep time: %lu ms (%.1f min)\n", sleepTimeMs, sleepTimeMs / 60000.0);
-
-    // Double for next time, but cap at maximum
-    errorSleepMs = min(errorSleepMs * 2, MAX_ERROR_SLEEP_MS);
-
-    display.setRotation(2);
-    display.setFullWindow();
-    display.firstPage();
-    do {
-      display.fillScreen(GxEPD_WHITE);
-      display.setFont(&FreeMonoBold9pt7b);
-
-      // Error title
-      display.setTextColor(GxEPD_RED);
-      display.setCursor(10, 30);
-      display.print("ERROR");
-
-      // Error details with word wrap
-      display.setTextColor(GxEPD_BLACK);
-      String details = getErrorDetails();
-
-      int y = 70;
+    // Error details (word wrapped)
+    int y = 100;
+    if(result.errorDetails.length() > 0) {
       int maxChars = 35;  // ~35 chars fit on 800px width
+      String details = result.errorDetails;
       for(int i = 0; i < details.length(); i += maxChars) {
         String line = details.substring(i, min(i + maxChars, (int)details.length()));
         display.setCursor(10, y);
         display.print(line);
         y += 25;
       }
+    }
 
-      // Retry info
-      display.setCursor(10, y + 20);
-      display.printf("Retry: %.0f min", sleepTimeMs / 60000.0);
-      display.setCursor(10, y + 45);
-      display.printf("Attempt: %d", consecutiveErrors);
+    // Retry info
+    display.setCursor(10, y + 20);
+    display.printf("Retry: %.0f min", sleepTimeMs / 60000.0);
+    display.setCursor(10, y + 45);
+    display.printf("Attempt: %d", consecutiveErrors);
 
-      // WiFi signal if still connected
-      if(WiFi.status() == WL_CONNECTED) {
-        display.setCursor(10, y + 70);
-        display.printf("RSSI: %d dBm", WiFi.RSSI());
-      }
-    } while(display.nextPage());
-  } else {
-    // Success! Use normal sleep time from API (or default)
-    Serial.printf("Success! Next update in %lu ms (%.1f min)\n", sleepTimeMs, sleepTimeMs / 60000.0);
+    // WiFi signal if still connected
+    if(WiFi.status() == WL_CONNECTED) {
+      display.setCursor(10, y + 70);
+      display.printf("RSSI: %d dBm", WiFi.RSSI());
+    }
+  } while(display.nextPage());
+}
+
+void handleError(const OperationResult &result) {
+  Serial.println("=== ERROR HANDLER ===");
+  Serial.printf("   Error: %s\n", result.errorMsg.c_str());
+  if(result.errorDetails.length() > 0) {
+    Serial.printf("   Details: %s\n", result.errorDetails.c_str());
   }
 
-  Serial.println("Putting display into hibernate");
+  consecutiveErrors++;
+  errorMessage = result.errorMsg;
+
+  // Calculate exponential backoff
+  sleepTimeMs = MIN_ERROR_SLEEP_MS * (1 << min(consecutiveErrors - 1, 3));
+  sleepTimeMs = min(sleepTimeMs, MAX_ERROR_SLEEP_MS);
+
+  Serial.printf("   Consecutive errors: %d\n", consecutiveErrors);
+  Serial.printf("   Next retry in %.1f minutes\n", sleepTimeMs / 60000.0);
+
+  // Display error on screen
+  displayError(result);
+}
+
+void setup(){
+  Serial.begin(115200);
+  delay(500);
+
+  Serial.println("\n\n======================");
+  Serial.println("ESP32 Open Canvas v2.1");
+  Serial.println("======================\n");
+
+  SystemState state = STATE_INIT;
+  OperationResult result;
+  String imageURL;
+  unsigned long remainingMs = DEFAULT_SLEEP_MS;
+
+  // State machine main loop
+  while(state != STATE_SLEEP) {
+    switch(state) {
+      case STATE_INIT:
+        Serial.println("\n>>> PHASE: Hardware Initialization");
+        result = initHardware();
+        if(result.success) {
+          state = STATE_WIFI_CONNECT;
+        } else {
+          state = STATE_ERROR;
+        }
+        break;
+
+      case STATE_WIFI_CONNECT:
+        Serial.println("\n>>> PHASE: WiFi Connection");
+        result = connectWiFi();
+        if(result.success) {
+          // Test DNS resolution
+          Serial.println("   Testing DNS resolution...");
+          IPAddress serverIP;
+          if(WiFi.hostByName("canvas.berguecio.cl", serverIP)){
+            Serial.printf("   DNS OK: canvas.berguecio.cl -> %s\n", serverIP.toString().c_str());
+          } else {
+            Serial.println("   WARNING: DNS resolution failed!");
+          }
+          state = STATE_API_FETCH;
+        } else {
+          state = STATE_ERROR;
+        }
+        break;
+
+      case STATE_API_FETCH:
+        Serial.println("\n>>> PHASE: API Fetch");
+        result = fetchImageURL(imageURL, remainingMs);
+        if(result.success) {
+          state = STATE_DOWNLOAD;
+        } else {
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_OFF);
+          state = STATE_ERROR;
+        }
+        break;
+
+      case STATE_DOWNLOAD:
+        Serial.println("\n>>> PHASE: Download Image");
+        result = downloadToSpiffs(imageURL);
+        if(result.success) {
+          // Turn off LED to indicate success
+          digitalWrite(LED_PIN, LOW);
+          delay(500);
+
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_OFF);
+          state = STATE_DISPLAY;
+        } else {
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_OFF);
+          state = STATE_ERROR;
+        }
+        break;
+
+      case STATE_DISPLAY:
+        Serial.println("\n>>> PHASE: Display Image");
+        showBMP();
+        consecutiveErrors = 0;  // Reset on success
+        errorSleepMs = MIN_ERROR_SLEEP_MS;  // Reset backoff
+        sleepTimeMs = remainingMs;
+        state = STATE_SLEEP;
+        break;
+
+      case STATE_ERROR:
+        Serial.println("\n>>> PHASE: Error Handler");
+        handleError(result);
+        state = STATE_SLEEP;
+        break;
+
+      case STATE_SLEEP:
+        // Will exit loop
+        break;
+    }
+  }
+
+  // Enter deep sleep
+  Serial.println("\n======================");
+  Serial.printf("Deep sleep for %.1f minutes\n", sleepTimeMs / 60000.0);
+  Serial.println("======================\n");
+
   display.hibernate();
-  Serial.printf("Deep sleep for %lu ms\n", sleepTimeMs);
   esp_sleep_enable_timer_wakeup(sleepTimeMs * 1000ULL);
-  Serial.println("Entering deep sleep now");
   esp_deep_sleep_start();
 }
 
