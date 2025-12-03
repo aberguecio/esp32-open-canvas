@@ -39,17 +39,19 @@ SPIClass epdSPI(FSPI);
 
 // WiFi Configuration
 const unsigned long WIFI_INIT_DELAY_MS = 500;        // Delay before WiFi init
-const unsigned long WIFI_CONNECT_TIMEOUT_MS = 120000; // 120s - INCREASED from 60s for weak WiFi
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 180000; // 180s - INCREASED from 60s for weak WiFi
 const unsigned long WIFI_STABILIZE_DELAY_MS = 1000;  // Delay after WiFi connects
+
+const int MAX_WIFI_RECONNECTS = 10;
 
 // HTTP/API Configuration
 const unsigned long API_HTTP_TIMEOUT_MS = 60000;     // 60s - INCREASED from 20s
-const int API_MAX_RETRIES = 5;                       // API fetch retry attempts
+const int API_MAX_RETRIES = 10;                       // API fetch retry attempts
 const unsigned long API_RETRY_DELAY_MS = 3000;       // 3s - INCREASED from 2s
 
 // Download Configuration
 const unsigned long DOWNLOAD_HTTP_TIMEOUT_MS = 60000;   // 60s - INCREASED from 30s
-const int DOWNLOAD_MAX_RETRIES = 3;                     // Download retry attempts
+const int DOWNLOAD_MAX_RETRIES = 10;                     // Download retry attempts
 const unsigned long DOWNLOAD_RETRY_DELAY_MS = 5000;     // 5s - INCREASED from 3s
 const unsigned long DOWNLOAD_STREAM_TIMEOUT_MS = 120000; // 120s - INCREASED from 60s
 const unsigned long DOWNLOAD_PROGRESS_INTERVAL_MS = 2000; // Progress print interval
@@ -57,7 +59,7 @@ const unsigned long DOWNLOAD_PROGRESS_INTERVAL_MS = 2000; // Progress print inte
 // Sleep Configuration
 const unsigned long DEFAULT_SLEEP_MS = 300000;        // 5 minutes default
 const unsigned long MIN_ERROR_SLEEP_MS = 300000;      // Start at 5 minutes on error
-const unsigned long MAX_ERROR_SLEEP_MS = 12000000;     // Max 200 minutes
+const unsigned long MAX_ERROR_SLEEP_MS = 24000000;     // Max 400 minutes
 
 // Hardware Configuration
 const unsigned long SPI_INIT_DELAY_MS = 100;          // SPI initialization delays
@@ -628,6 +630,8 @@ void setup(){
   String imageURL;
   unsigned long remainingMs = DEFAULT_SLEEP_MS;
 
+  // WiFi recovery tracking
+  int wifiReconnectAttempts = 0;
   // State machine main loop
   while(state != STATE_SLEEP) {
     switch(state) {
@@ -665,9 +669,18 @@ void setup(){
         if(result.success) {
           state = STATE_DOWNLOAD;
         } else {
-          WiFi.disconnect(true);
-          WiFi.mode(WIFI_OFF);
-          state = STATE_ERROR;
+          // Detect WiFi issues
+          if(result.errorDetails.indexOf("WiFi") >= 0 ||
+             result.errorDetails.indexOf("Connection") >= 0 ||
+             WiFi.status() != WL_CONNECTED) {
+            Serial.println("   WiFi issue detected, reconnecting...");
+            WiFi.disconnect(true);
+            state = STATE_WIFI_CONNECT;  // Go back to reconnect
+          } else {
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            state = STATE_ERROR;
+          }
         }
         break;
 
@@ -683,9 +696,25 @@ void setup(){
           WiFi.mode(WIFI_OFF);
           state = STATE_DISPLAY;
         } else {
-          WiFi.disconnect(true);
-          WiFi.mode(WIFI_OFF);
-          state = STATE_ERROR;
+          // Detect WiFi/connection issues
+          bool isWiFiIssue = (result.errorDetails.indexOf("WiFi") >= 0 ||
+                              result.errorDetails.indexOf("Connection") >= 0 ||
+                              WiFi.status() != WL_CONNECTED);
+
+          if(isWiFiIssue && wifiReconnectAttempts < MAX_WIFI_RECONNECTS) {
+            Serial.printf("   WiFi issue detected, reconnecting (attempt %d/%d)...\n",
+                          wifiReconnectAttempts + 1, MAX_WIFI_RECONNECTS);
+            wifiReconnectAttempts++;
+            WiFi.disconnect(true);
+            state = STATE_WIFI_CONNECT;  // Go back to reconnect
+          } else {
+            if(isWiFiIssue) {
+              Serial.println("   Max WiFi reconnect attempts reached");
+            }
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            state = STATE_ERROR;
+          }
         }
         break;
 
@@ -693,6 +722,7 @@ void setup(){
         Serial.println("\n>>> PHASE: Display Image");
         showBMP();
         consecutiveErrors = 0;  // Reset on success
+        wifiReconnectAttempts = 0;  // Reset WiFi reconnect counter
         errorSleepMs = MIN_ERROR_SLEEP_MS;  // Reset backoff
         sleepTimeMs = remainingMs;
         state = STATE_SLEEP;
