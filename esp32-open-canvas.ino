@@ -33,10 +33,37 @@ SPIClass epdSPI(FSPI);
     display(GxEPD2_DRIVER_CLASS(PIN_CS, PIN_DC, PIN_RST, PIN_BUSY));
 #endif
 
-// Sleep configuration
-const unsigned long DEFAULT_SLEEP_MS = 300000;  // 5 minutes default
-const unsigned long MIN_ERROR_SLEEP_MS = 300000;  // Start at 5 minutes on error
-const unsigned long MAX_ERROR_SLEEP_MS = 12000000; // Max 20 minutes
+//=============================================================================
+// CONFIGURATION - Adjust these values for your environment
+//=============================================================================
+
+// WiFi Configuration
+const unsigned long WIFI_INIT_DELAY_MS = 500;        // Delay before WiFi init
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 120000; // 120s - INCREASED from 60s for weak WiFi
+const unsigned long WIFI_STABILIZE_DELAY_MS = 1000;  // Delay after WiFi connects
+
+// HTTP/API Configuration
+const unsigned long API_HTTP_TIMEOUT_MS = 60000;     // 60s - INCREASED from 20s
+const int API_MAX_RETRIES = 5;                       // API fetch retry attempts
+const unsigned long API_RETRY_DELAY_MS = 3000;       // 3s - INCREASED from 2s
+
+// Download Configuration
+const unsigned long DOWNLOAD_HTTP_TIMEOUT_MS = 60000;   // 60s - INCREASED from 30s
+const int DOWNLOAD_MAX_RETRIES = 3;                     // Download retry attempts
+const unsigned long DOWNLOAD_RETRY_DELAY_MS = 5000;     // 5s - INCREASED from 3s
+const unsigned long DOWNLOAD_STREAM_TIMEOUT_MS = 120000; // 120s - INCREASED from 60s
+const unsigned long DOWNLOAD_PROGRESS_INTERVAL_MS = 2000; // Progress print interval
+
+// Sleep Configuration
+const unsigned long DEFAULT_SLEEP_MS = 300000;        // 5 minutes default
+const unsigned long MIN_ERROR_SLEEP_MS = 300000;      // Start at 5 minutes on error
+const unsigned long MAX_ERROR_SLEEP_MS = 12000000;     // Max 200 minutes
+
+// Hardware Configuration
+const unsigned long SPI_INIT_DELAY_MS = 100;          // SPI initialization delays
+
+//=============================================================================
+
 unsigned long sleepTimeMs = DEFAULT_SLEEP_MS;
 
 // Error tracking with exponential backoff
@@ -45,25 +72,33 @@ String errorMessage = "";
 RTC_DATA_ATTR unsigned long errorSleepMs = MIN_ERROR_SLEEP_MS;  // Persists across deep sleep
 RTC_DATA_ATTR int consecutiveErrors = 0;  // Track error streak
 
-void showMultiline(const String& txt){
-  Serial.println(">> showMultiline()");
-  display.setRotation(0);
-  display.setFullWindow();
-  display.firstPage();
-  do {
-    display.fillScreen(GxEPD_WHITE);
-    display.setFont(&FreeMonoBold9pt7b);
-    display.setTextColor(GxEPD_BLACK);
-    uint16_t lineH = FreeMonoBold9pt7b.yAdvance;
-    int16_t y = lineH;
-    for(size_t i=0; i<txt.length(); ){
-      String line = txt.substring(i, min(i+60, txt.length()));
-      display.setCursor(0,y);
-      display.print(line);
-      y += lineH;
-      i += 60;
+//=============================================================================
+// Helper Functions
+//=============================================================================
+
+// Helper to log HTTP error codes
+void logHTTPError(int code) {
+  if(code == -1) Serial.println("   (Connection error)");
+  else if(code == -5) Serial.println("   (Connection refused/timeout)");
+  else if(code == -11) Serial.println("   (Request timeout)");
+  else Serial.printf("   (HTTP error code: %d)\n", code);
+}
+
+// Helper to format error messages for display
+String getErrorDetails() {
+  String details = errorMessage;
+
+  if(WiFi.status() != WL_CONNECTED && errorMessage == "WiFi failed") {
+    details += "\nStatus: ";
+    switch(WiFi.status()) {
+      case 1: details += "No SSID"; break;
+      case 4: details += "Connection failed"; break;
+      case 6: details += "Disconnected"; break;
+      default: details += String(WiFi.status()); break;
     }
-  } while(display.nextPage());
+  }
+
+  return details;
 }
 
 String fetchImageURL(){
@@ -71,22 +106,14 @@ String fetchImageURL(){
   Serial.printf("   API URL: %s\n", API_URL);
 
   HTTPClient http;
-  http.setTimeout(20000);  // 20 second timeout for weak signal
+  http.setTimeout(API_HTTP_TIMEOUT_MS);
 
   int code = -1;
-  const int maxRetries = 5;
 
-  for(int retry = 0; retry < maxRetries; retry++) {
+  for(int retry = 0; retry < API_MAX_RETRIES; retry++) {
     if(retry > 0) {
-      Serial.printf("   Retry attempt %d/%d\n", retry + 1, maxRetries);
-      
-      // Check WiFi before retrying
-      if(WiFi.status() != WL_CONNECTED){
-        Serial.println("   WiFi lost, reconnecting...");
-        connectWiFi();
-      }
-      
-      delay(2000);  // Wait 2 seconds between retries
+      Serial.printf("   Retry attempt %d/%d\n", retry + 1, API_MAX_RETRIES);
+      delay(API_RETRY_DELAY_MS);
     }
 
     Serial.println("   Starting HTTP connection...");
@@ -105,10 +132,7 @@ String fetchImageURL(){
       break;  // Success!
     }
 
-    // Log specific errors
-    if(code == -1) Serial.println("   (Connection error)");
-    if(code == -5) Serial.println("   (Connection refused/timeout)");
-    if(code == -11) Serial.println("   (Timeout)");
+    logHTTPError(code);
     http.end();
   }
 
@@ -158,20 +182,20 @@ String fetchImageURL(){
 bool downloadToSpiffs(const String& url){
   Serial.printf(">> downloadToSpiffs(): URL = %s\n", url.c_str());
 
-  const int maxRetries = 3;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.setTimeout(DOWNLOAD_HTTP_TIMEOUT_MS);
+
   int code = -1;
 
-  for(int retry = 0; retry < maxRetries; retry++) {
+  for(int retry = 0; retry < DOWNLOAD_MAX_RETRIES; retry++) {
     if(retry > 0) {
-      Serial.printf("   Download retry attempt %d/%d\n", retry + 1, maxRetries);
-      delay(3000);  // Wait 3 seconds between download retries
+      Serial.printf("   Retry %d/%d\n", retry + 1, DOWNLOAD_MAX_RETRIES);
+      delay(DOWNLOAD_RETRY_DELAY_MS);
+      http.end();
     }
-
-    WiFiClientSecure client;
-    client.setInsecure();
-    HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setTimeout(30000);  // 30 second timeout
 
     if(!http.begin(client, url)) {
       Serial.println("   ERROR: http.begin() failed");
@@ -182,32 +206,18 @@ bool downloadToSpiffs(const String& url){
     code = http.GET();
     Serial.printf("   HTTP code %d\n", code);
 
-    if(code == HTTP_CODE_OK){
-      // Success! Continue with download
-      break;
-    }
+    if(code == HTTP_CODE_OK) break;
 
-    // Log error and retry
-    Serial.println("   ERROR: image download failed");
-    if(code == -1) Serial.println("   (Connection error)");
-    if(code == -5) Serial.println("   (Connection refused/timeout)");
-    if(code == -11) Serial.println("   (Timeout)");
-    http.end();
+    logHTTPError(code);
   }
 
   if(code != HTTP_CODE_OK){
-    Serial.println("   ERROR: image download failed after all retries");
+    Serial.println("   ERROR: Download failed after all retries");
+    http.end();
     return false;
   }
 
-  // At this point we have a successful HTTP connection
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(30000);
-  http.begin(client, url);
-  http.GET();  // Re-establish connection for actual download
+  // Now we have a successful connection - proceed with download
 
   // Check SPIFFS space
   size_t totalBytes = SPIFFS.totalBytes();
@@ -248,11 +258,10 @@ bool downloadToSpiffs(const String& url){
   size_t total = 0;
   unsigned long lastPrint = millis();
   unsigned long downloadStart = millis();
-  const unsigned long DOWNLOAD_TIMEOUT = 60000;  // 60 seconds max
 
   while(contentLength > 0 || contentLength == -1) {
     // Check timeout
-    if(millis() - downloadStart > DOWNLOAD_TIMEOUT) {
+    if(millis() - downloadStart > DOWNLOAD_STREAM_TIMEOUT_MS) {
       Serial.println("   ERROR: Download timeout");
       f.close();
       http.end();
@@ -277,8 +286,8 @@ bool downloadToSpiffs(const String& url){
           contentLength -= c;
         }
 
-        // Print progress every 2 seconds
-        if(millis() - lastPrint > 2000) {
+        // Print progress
+        if(millis() - lastPrint > DOWNLOAD_PROGRESS_INTERVAL_MS) {
           Serial.printf("   Downloaded: %u bytes\n", total);
           lastPrint = millis();
         }
@@ -327,14 +336,12 @@ void showBMP(){
   File f = SPIFFS.open("/img", FILE_READ);
   if(!f){
     Serial.println("   ERROR: /img open fail");
-    showMultiline("/img open fail");
     return;
   }
 
   Serial.println("   Checking BMP header");
   if(f.read()!='B' || f.read()!='M'){
     Serial.println("   ERROR: Not BMP");
-    showMultiline("Not BMP");
     f.close();
     return;
   }
@@ -350,7 +357,6 @@ void showBMP(){
   if(w != display.width() || h != display.height()){
     Serial.printf("   ERROR: size mismatch. Expected %dx%d, got %ldx%ld\n",
                   display.width(), display.height(), w, h);
-    showMultiline("size mismatch");
     f.close();
     return;
   }
@@ -360,7 +366,6 @@ void showBMP(){
   Serial.printf("   bpp = %u\n", bpp);
   if(bpp != 4){
     Serial.println("   ERROR: not 4-bpp");
-    showMultiline("not 4-bpp");
     f.close();
     return;
   }
@@ -404,7 +409,7 @@ void connectWiFi(){
   Serial.printf(">> connectWiFi(): SSID=%s\n", WIFI_SSID);
 
   // ESP32-C6 needs time to initialize WiFi after deep sleep
-  delay(500);
+  delay(WIFI_INIT_DELAY_MS);
 
   // Disconnect any previous connection
   WiFi.disconnect(true);
@@ -422,7 +427,7 @@ void connectWiFi(){
   uint32_t start = millis();
   int attempts = 0;
 
-  while(WiFi.status() != WL_CONNECTED && millis() - start < 60000){  // Increased to 1 minute
+  while(WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS){
     Serial.print(".");
     delay(500);
     attempts++;
@@ -452,11 +457,11 @@ void setup(){
   Serial.println("=== STARTUP ===");
 
   #if defined(ESP32)
-    delay(100);  // Dar tiempo al hardware antes de inicializar SPI
+    delay(SPI_INIT_DELAY_MS);  // Hardware initialization delay
     epdSPI.begin(23, 21, 22, PIN_CS);
     display.epd2.selectSPI(epdSPI,
       SPISettings(4000000, MSBFIRST, SPI_MODE0));
-    delay(100);  // Estabilizar antes de init del display
+    delay(SPI_INIT_DELAY_MS);  // Stabilization delay
   #endif
 
   Serial.println("Initializing display");
@@ -477,7 +482,7 @@ void setup(){
   } else {
     // Wait for WiFi to fully stabilize before making requests
     Serial.println("WiFi connected, waiting for stack to stabilize...");
-    delay(1000);
+    delay(WIFI_STABILIZE_DELAY_MS);
 
     // Test DNS resolution
     Serial.println("Testing DNS resolution...");
@@ -533,16 +538,36 @@ void setup(){
     do {
       display.fillScreen(GxEPD_WHITE);
       display.setFont(&FreeMonoBold9pt7b);
+
+      // Error title
       display.setTextColor(GxEPD_RED);
-      display.setCursor(10, 50);
-      display.print("ERROR:");
-      display.setCursor(10, 100);
-      display.print(errorMessage);
+      display.setCursor(10, 30);
+      display.print("ERROR");
+
+      // Error details with word wrap
       display.setTextColor(GxEPD_BLACK);
-      display.setCursor(10, 150);
-      display.printf("Retry in %.0f min", sleepTimeMs / 60000.0);
-      display.setCursor(10, 180);
+      String details = getErrorDetails();
+
+      int y = 70;
+      int maxChars = 35;  // ~35 chars fit on 800px width
+      for(int i = 0; i < details.length(); i += maxChars) {
+        String line = details.substring(i, min(i + maxChars, (int)details.length()));
+        display.setCursor(10, y);
+        display.print(line);
+        y += 25;
+      }
+
+      // Retry info
+      display.setCursor(10, y + 20);
+      display.printf("Retry: %.0f min", sleepTimeMs / 60000.0);
+      display.setCursor(10, y + 45);
       display.printf("Attempt: %d", consecutiveErrors);
+
+      // WiFi signal if still connected
+      if(WiFi.status() == WL_CONNECTED) {
+        display.setCursor(10, y + 70);
+        display.printf("RSSI: %d dBm", WiFi.RSSI());
+      }
     } while(display.nextPage());
   } else {
     // Success! Use normal sleep time from API (or default)

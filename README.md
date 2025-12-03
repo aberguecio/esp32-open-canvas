@@ -27,7 +27,7 @@ Remote display system for Waveshare 7.3" ACeP e-ink display (7 colors) using Fir
 | CS          | GPIO1         | Chip Select |
 | DC          | GPIO8         | Data/Command |
 | RST         | GPIO14        | Reset |
-| BUSY        | GPIO4         | Busy Signal |
+| BUSY        | GPIO17        | Busy Signal |
 | SCK         | GPIO23        | SPI Clock |
 | MOSI        | GPIO22        | SPI Data Out |
 | MISO        | GPIO21        | SPI Data In |
@@ -118,7 +118,7 @@ const char* API_URL = "https://your-server.com/api/v1/images";
 
 1. **Wake up** from deep sleep
 2. **Initialize** hardware (SPI, display, SPIFFS)
-3. **Connect** to WiFi (15-second timeout)
+3. **Connect** to WiFi (90-second timeout)
 4. **Download** metadata from API
 5. **Download** BMP image to SPIFFS
 6. **Render** image on e-ink display
@@ -134,7 +134,7 @@ const char* API_URL = "https://your-server.com/api/v1/images";
 
 ## Error Handling
 
-The system displays errors on the e-ink screen and retries after 1 minute.
+The system displays errors on the e-ink screen with **exponential backoff** retry strategy.
 
 **Error types:**
 
@@ -142,7 +142,53 @@ The system displays errors on the e-ink screen and retries after 1 minute.
 - ❌ **API error** - Cannot fetch image URL
 - ❌ **Download failed** - Image download timeout or error
 
-All errors are also logged to Serial Monitor (115200 baud).
+**Retry behavior:**
+
+- 1st error: Retry in 5 minutes
+- 2nd error: Retry in 10 minutes (2x)
+- 3rd error: Retry in 20 minutes (2x)
+- 4th error: Retry in 40 minutes (2x)
+- 5th+ error: Retry in 80 minutes up to max 200 minutes
+- Success: Reset to normal 5-minute interval
+
+This prevents battery drain from rapid retry attempts while ensuring eventual recovery.
+
+All errors are also logged to Serial Monitor (115200 baud) with detailed diagnostics.
+
+## Configuration & Timeouts
+
+All timeouts and retry settings can be adjusted at the top of `esp32-open-canvas.ino`:
+
+### Default Configuration
+
+| Setting | Default Value | Description |
+|---------|---------------|-------------|
+| WiFi Init Delay | 500ms | Delay before WiFi initialization |
+| WiFi Connect Timeout | 90s | Maximum time to wait for WiFi connection |
+| WiFi Stabilize Delay | 1000ms | Delay after WiFi connects |
+| API HTTP Timeout | 30s | Timeout for API requests |
+| API Max Retries | 5 | Number of API fetch retry attempts |
+| API Retry Delay | 3s | Delay between API retries |
+| Download HTTP Timeout | 45s | Timeout for image download requests |
+| Download Max Retries | 3 | Number of download retry attempts |
+| Download Retry Delay | 5s | Delay between download retries |
+| Download Stream Timeout | 90s | Timeout for streaming image data |
+| SPI Init Delay | 100ms | Hardware initialization delays |
+
+### Recommended Settings for Weak WiFi Signal
+
+If you experience frequent connection issues (RSSI < -80 dBm), increase these values:
+
+| Setting | Default | Weak Signal |
+|---------|---------|-------------|
+| WiFi Connect Timeout | 90s | 120s |
+| API HTTP Timeout | 30s | 45s |
+| Download HTTP Timeout | 45s | 60s |
+| Download Stream Timeout | 90s | 120s |
+| API Retry Delay | 3s | 5s |
+| Download Retry Delay | 5s | 8s |
+
+**To adjust:** Edit the configuration section at the top of `esp32-open-canvas.ino` (after line 36).
 
 ## Troubleshooting
 
@@ -206,24 +252,34 @@ esp32-open-canvas/
 
 This version includes several optimizations over the original:
 
+### Configuration
+- ✅ **All timeouts configurable** - Single location at top of file
+- ✅ **Increased timeouts** - Better reliability for weak WiFi (90s WiFi, 45s download)
+- ✅ **Easy customization** - Adjust values without hunting through code
+
 ### Security
 - ✅ Credentials moved to separate `config.h` file
 - ✅ `.gitignore` prevents credential leaks
 
 ### Power Efficiency
 - ✅ WiFi auto-disconnect after download (~50-80mA savings)
-- ✅ Optimized sleep times (5 min normal, 1 min on error)
+- ✅ Exponential backoff on errors (5→10→20→40→80→200 min max)
 
 ### Robustness
-- ✅ 30-second HTTP timeout
-- ✅ Error display on screen
-- ✅ Automatic retry on errors
+- ✅ **Improved download logic** - Removed duplicate HTTP connections
+- ✅ **Size validation** - Detects partial downloads and retries
+- ✅ **Centralized error handling** - `logHTTPError()` and `getErrorDetails()` helpers
+- ✅ **Enhanced error display** - Shows detailed error info with WiFi signal strength
+- ✅ Multiple retry attempts (5x API, 3x download)
 - ✅ Dynamic dimension validation
 
 ### Code Quality
-- ✅ Removed dead code (USE_HSPI_FOR_EPD, centerText())
-- ✅ Better error messages
-- ✅ Cleaner structure
+- ✅ **Cleaner code** - Removed ~50 lines of redundant/dead code
+- ✅ **No duplicate logic** - Error logging centralized
+- ✅ **Better structure** - Configuration section, helper functions
+- ✅ Removed obsolete `showMultiline()` function (19 lines)
+- ✅ Removed unnecessary WiFi reconnect logic
+- ✅ Better error messages throughout
 
 ## Contributing
 
