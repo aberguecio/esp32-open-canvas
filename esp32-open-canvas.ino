@@ -277,9 +277,9 @@ OperationResult downloadToSpiffs(const String& url){
 
     Serial.println("   File opened, getting WiFiClient stream...");
 
-    // Get content length
-    int contentLength = http.getSize();
-    Serial.printf("   Expected content length: %d bytes\n", contentLength);
+    // Get content length - save original value for validation
+    int expectedContentLength = http.getSize();
+    Serial.printf("   Expected content length: %d bytes\n", expectedContentLength);
 
     // Get the stream
     WiFiClient * stream = http.getStreamPtr();
@@ -293,11 +293,12 @@ OperationResult downloadToSpiffs(const String& url){
     // Download with progress and timeout protection
     uint8_t buff[512];
     size_t total = 0;
+    int remainingBytes = expectedContentLength;  // Countdown for loop control
     unsigned long lastPrint = millis();
     unsigned long downloadStart = millis();
     bool streamError = false;
 
-    while(contentLength > 0 || contentLength == -1) {
+    while(remainingBytes > 0 || remainingBytes == -1) {
       // Check timeout
       if(millis() - downloadStart > DOWNLOAD_STREAM_TIMEOUT_MS) {
         Serial.println("   ERROR: Download timeout");
@@ -316,13 +317,18 @@ OperationResult downloadToSpiffs(const String& url){
             break;
           }
           total += c;
-          if(contentLength > 0) {
-            contentLength -= c;
+          if(remainingBytes > 0) {
+            remainingBytes -= c;
           }
 
           // Print progress
           if(millis() - lastPrint > DOWNLOAD_PROGRESS_INTERVAL_MS) {
-            Serial.printf("   Downloaded: %u bytes\n", total);
+            Serial.printf("   Downloaded: %u bytes", total);
+            if(expectedContentLength > 0) {
+              Serial.printf(" / %d (%.1f%%)\n", expectedContentLength, (total * 100.0 / expectedContentLength));
+            } else {
+              Serial.println();
+            }
             lastPrint = millis();
           }
 
@@ -352,11 +358,11 @@ OperationResult downloadToSpiffs(const String& url){
     }
 
     // Validate size matches expected from HTTP headers
-    int expectedSize = contentLength == -1 ? http.getSize() : http.getSize();
-    if(expectedSize > 0 && total != (size_t)expectedSize) {
-      Serial.printf("   ERROR: Size mismatch! Expected %d, got %u\n", expectedSize, total);
+    if(expectedContentLength > 0 && total != (size_t)expectedContentLength) {
+      Serial.printf("   ERROR: Size mismatch! Expected %d, got %u (%.1f%%)\n",
+                    expectedContentLength, total, (total * 100.0 / expectedContentLength));
       SPIFFS.remove("/img");  // Remove partial file
-      lastErrorDetails = "Size mismatch: got " + String(total) + " of " + String(expectedSize) + " bytes";
+      lastErrorDetails = "Incomplete download: got " + String(total) + " of " + String(expectedContentLength) + " bytes";
       continue;  // Retry
     }
 
@@ -465,14 +471,28 @@ OperationResult initHardware() {
   pinMode(PIN_BUSY, INPUT_PULLUP);
 
   #if defined(ESP32)
+    // Ensure clean SPI state after deep sleep
     delay(SPI_INIT_DELAY_MS);  // Hardware initialization delay
+
+    // Initialize SPI with explicit pins for ESP32-C6
     epdSPI.begin(23, 21, 22, PIN_CS);
+    delay(50);
+
+    // Set SPI parameters
     display.epd2.selectSPI(epdSPI, SPISettings(4000000, MSBFIRST, SPI_MODE0));
     delay(SPI_INIT_DELAY_MS);  // Stabilization delay
   #endif
 
-  // Initialize display
+  // Initialize display with full reset
   Serial.println("   Initializing display");
+
+  // Ensure RST pin is properly configured
+  pinMode(PIN_RST, OUTPUT);
+  digitalWrite(PIN_RST, LOW);
+  delay(10);
+  digitalWrite(PIN_RST, HIGH);
+  delay(10);
+
   display.init(115200);
   Serial.println("   Display initialized successfully");
 
@@ -494,14 +514,16 @@ OperationResult connectWiFi(){
   // ESP32-C6 needs time to initialize WiFi after deep sleep
   delay(WIFI_INIT_DELAY_MS);
 
-  // Disconnect any previous connection
+  // Complete WiFi reset - critical after deep sleep
   WiFi.disconnect(true);
-  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(500);  // Increased delay for complete shutdown
 
-  // Set WiFi mode and wait for it to stabilize
+  // Reinitialize WiFi stack
   WiFi.mode(WIFI_STA);
-  // Set max TX power to improve range
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  delay(200);  // Wait for mode change
+
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // Max TX power
   delay(100);
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -606,8 +628,8 @@ void handleError(const OperationResult &result) {
   consecutiveErrors++;
   errorMessage = result.errorMsg;
 
-  // Calculate exponential backoff
-  sleepTimeMs = MIN_ERROR_SLEEP_MS * (1 << min(consecutiveErrors - 1, 3));
+  // Calculate exponential backoff: 5, 10, 20, 40, 80, 160, 320... up to MAX
+  sleepTimeMs = MIN_ERROR_SLEEP_MS * (1 << (consecutiveErrors - 1));
   sleepTimeMs = min(sleepTimeMs, MAX_ERROR_SLEEP_MS);
 
   Serial.printf("   Consecutive errors: %d\n", consecutiveErrors);
